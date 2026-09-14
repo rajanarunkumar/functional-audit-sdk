@@ -5,6 +5,7 @@ Each applied migration's checksum is recorded; a migration file that changes aft
 applied fails `fa init` instead of silently diverging from the deployed schema."""
 from __future__ import annotations
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from importlib import resources
@@ -14,6 +15,7 @@ from functional_audit.config import Settings
 
 _VERSION_RE = re.compile(r"^V(\d{3})__(.+)\.sql$")
 _PRINCIPAL_RE = re.compile(r"^[A-Za-z0-9_@.\- ]+$")
+_REQUIRES_RE = re.compile(r"^--\s*requires:\s*(\w+)\s*$", re.M)
 
 
 class MigrationError(RuntimeError):
@@ -29,6 +31,24 @@ class Migration:
     @property
     def checksum(self) -> str:
         return checksum(self.sql)
+
+    @property
+    def requires(self) -> str | None:
+        """Engine requirement declared in the file header (`-- requires: databricks`), if any."""
+        m = _REQUIRES_RE.search(self.sql)
+        return m.group(1).lower() if m else None
+
+
+def is_databricks(spark) -> bool:
+    """True on Databricks Runtime, Databricks Connect and serverless; False on OSS Spark."""
+    if os.getenv("DATABRICKS_RUNTIME_VERSION"):
+        return True
+    try:
+        if spark.conf.get("spark.databricks.clusterUsageTags.sparkVersion", None):
+            return True
+    except Exception:
+        pass
+    return "databricks" in type(spark).__module__ or "databricks" in str(getattr(spark, "version", "")).lower()
 
 
 def checksum(sql: str) -> str:
@@ -92,8 +112,12 @@ def applied(spark, s: Settings) -> dict[str, str | None]:
         return {}
 
 
-def apply(spark, s: Settings, sdk_version: str, dry_run: bool = False) -> list[str]:
-    """Apply pending migrations. Returns the list of versions applied (or planned if dry_run)."""
+def apply(spark, s: Settings, sdk_version: str, dry_run: bool = False, databricks: bool | None = None) -> list[str]:
+    """Apply pending migrations. Returns the list of versions applied (or planned if dry_run).
+
+    A migration whose header declares `-- requires: databricks` is skipped on other engines and
+    applied on the next `fa init` that runs on Databricks."""
+    databricks = is_databricks(spark) if databricks is None else databricks
     done = applied(spark, s)
     out = []
     for m in load_migrations():
@@ -101,6 +125,8 @@ def apply(spark, s: Settings, sdk_version: str, dry_run: bool = False) -> list[s
             if done[m.version] and done[m.version] != m.checksum:
                 raise MigrationError(f"migration V{m.version} changed after it was applied "
                                      f"(applied {done[m.version][:12]}, file {m.checksum[:12]})")
+            continue
+        if m.requires == "databricks" and not databricks:
             continue
         stmts = split_statements(render(m.sql, s))
         if dry_run:

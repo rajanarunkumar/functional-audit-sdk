@@ -30,7 +30,8 @@ def test_view_naming_is_domain_agnostic():
 
 def test_migrations_render_split_and_checksum():
     ms = load_migrations()
-    assert [m.version for m in ms] == ["001", "002"]
+    assert [m.version for m in ms] == ["001", "002", "003"]
+    assert [m.requires for m in ms] == [None, None, "databricks"]
     stmts = split_statements(render(ms[0].sql, Settings()))
     assert any("CREATE TABLE IF NOT EXISTS platform_gov.functional_audit.runs" in x for x in stmts)
     assert not any("${" in x for x in stmts)

@@ -65,11 +65,11 @@ def tables(spark):
 
 
 @pytest.fixture(scope="session")
-def settings(delta):
+def settings(delta, tmp_path_factory):
     """Audit schema settings for the local catalog; the stage reads them from the environment."""
     from functional_audit.config import Settings
     os.environ.update({"FA_CATALOG": "spark_catalog", "FA_SCHEMA": "functional_audit", "FA_ENFORCE": "warn",
-                       "FA_TELEMETRY_TIER": "2"})
+                       "FA_TELEMETRY_TIER": "2", "FA_PLANS_PATH": str(tmp_path_factory.mktemp("plans"))})
     return Settings.from_env()
 
 

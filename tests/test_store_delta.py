@@ -79,11 +79,11 @@ def test_run_lifecycle_and_evidence_flush(store, delta, audit_schema):
     store.upsert_reconciliation("r-1", "PROVISIONAL", "ATTESTED", {"plan": {"executed": "h"}}, [])
     store.upsert_reconciliation("r-1", "PROVISIONAL", "DEVIATION", {"plan": {}}, [{"code": "X"}])
     store.update_run("r-1", status="SUCCEEDED", ended_at=datetime.now(timezone.utc), logic_hash_executed="h",
-                     plan_text="Project", literals=["1", "2"], plan_proto=b"\x01\x02", attestation_stage="PROVISIONAL")
+                     plan_proto_path="/Volumes/x/y/plans/r-1.pb", plan_proto=b"\x01\x02", attestation_stage="PROVISIONAL")
     row = store.run_row("r-1")
-    assert row["status"] == "SUCCEEDED" and row["plan_text"] == "Project" and bytes(row["plan_proto"]) == b"\x01\x02"
-    assert delta.sql(f"SELECT to_json(literals), variant_get(scenario_params, '$.p', 'int') "
-                     f"FROM {audit_schema.table('runs')} WHERE run_id = 'r-1'").collect()[0][:] == ('["1","2"]', 1)
+    assert row["status"] == "SUCCEEDED" and row["plan_proto_path"].endswith("r-1.pb") and bytes(row["plan_proto"]) == b"\x01\x02"
+    assert delta.sql(f"SELECT variant_get(scenario_params, '$.p', 'int') "
+                     f"FROM {audit_schema.table('runs')} WHERE run_id = 'r-1'").collect()[0][0] == 1
     inputs = delta.table(audit_schema.table("run_inputs")).where(F.col("run_id") == "r-1").orderBy("object_name").collect()
     assert [(r["object_name"], r["delta_version"], r["declared"]) for r in inputs] == [("c.s.i", 3, True), ("c.s.x", None, False)]
     rec = delta.table(audit_schema.table("reconciliations")).where(F.col("run_id") == "r-1").collect()

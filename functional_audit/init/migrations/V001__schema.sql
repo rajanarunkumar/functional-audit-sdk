@@ -1,5 +1,11 @@
 -- functional_audit V001: system schema. Templated: ${CATALOG} ${SCHEMA}
 -- Portable Delta SQL: runs on Databricks and on OSS Spark 4 + delta-spark (used by the test suite).
+-- Informational PRIMARY KEY / FOREIGN KEY constraints and the plans volume are Databricks-only and live in V003.
+--
+-- Audit-column convention (matches UC information_schema):
+--   human-touched tables  (contracts, attestations)          created, created_by, last_altered, last_altered_by
+--   system, append-only   (everything else)                   created only; no deletes
+--   reconciliations       re-graded in place by the platform  created + last_altered, no _by
 CREATE SCHEMA IF NOT EXISTS ${CATALOG}.${SCHEMA}
   COMMENT 'functional_audit: transformation contracts, run evidence, lineage, reconciliation, attestation';
 
@@ -46,6 +52,12 @@ USING DELTA
 CLUSTER BY (contract_id, run_id)
 TBLPROPERTIES (delta.enableChangeDataFeed = true, 'functional_audit.write_class' = 'human');
 
+ALTER TABLE ${CATALOG}.${SCHEMA}.attestations ADD CONSTRAINT ck_attestations_decision
+  CHECK (decision IN ('APPROVED', 'WAIVED', 'REVOKED'));
+
+ALTER TABLE ${CATALOG}.${SCHEMA}.attestations ADD CONSTRAINT ck_attestations_scope
+  CHECK (run_id IS NOT NULL OR (contract_id IS NOT NULL AND period IS NOT NULL));
+
 -- system-only, append-only ---------------------------------------------------
 CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.contract_deps (
   contract_id       STRING NOT NULL,
@@ -57,6 +69,9 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.contract_deps (
 )
 USING DELTA CLUSTER BY (contract_id, contract_version)
 TBLPROPERTIES ('functional_audit.write_class' = 'system');
+
+ALTER TABLE ${CATALOG}.${SCHEMA}.contract_deps ADD CONSTRAINT ck_contract_deps_direction
+  CHECK (direction IN ('INPUT', 'OUTPUT'));
 
 CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.runs (
   run_id                 STRING    NOT NULL,
@@ -72,10 +87,8 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.runs (
   logic_hash_executed    STRING,             -- structure hash of the optimized plan, literals lifted
   binding_hash           STRING,             -- literals + pinned input versions + period + parameters
   code_hash              STRING,
-  code_hash_source       STRING,             -- source | name (name when the function source was unavailable)
-  plan_text              STRING,             -- canonical plan text that produced logic_hash_executed
-  literals               VARIANT,            -- lifted literal vector, in plan order
-  plan_proto             BINARY,             -- serialized Spark Connect plan when small enough
+  plan_proto_path        STRING,             -- serialized Spark Connect plan in the plans volume, when written
+  plan_proto             BINARY,             -- the same, inline when small enough
   workspace_id           STRING,
   metastore_id           STRING,
   entity_type            STRING,
@@ -100,6 +113,18 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.runs (
 )
 USING DELTA CLUSTER BY (contract_id, run_id)
 TBLPROPERTIES (delta.enableChangeDataFeed = true, 'functional_audit.write_class' = 'system');
+
+ALTER TABLE ${CATALOG}.${SCHEMA}.runs ADD CONSTRAINT ck_runs_status
+  CHECK (status IN ('RUNNING', 'SUCCEEDED', 'QUARANTINED', 'FAILED', 'ABANDONED'));
+
+ALTER TABLE ${CATALOG}.${SCHEMA}.runs ADD CONSTRAINT ck_runs_kind
+  CHECK (run_kind IN ('incremental', 'backfill', 'replay', 'restatement'));
+
+ALTER TABLE ${CATALOG}.${SCHEMA}.runs ADD CONSTRAINT ck_runs_purpose
+  CHECK (run_purpose IN ('PRODUCTION', 'SHADOW', 'WHAT_IF', 'ESTIMATE', 'TEST'));
+
+ALTER TABLE ${CATALOG}.${SCHEMA}.runs ADD CONSTRAINT ck_runs_attestation_stage
+  CHECK (attestation_stage IS NULL OR attestation_stage IN ('PROVISIONAL', 'FINAL'));
 
 CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.run_inputs (
   run_id        STRING NOT NULL,
@@ -148,6 +173,15 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.lineage_observed (
 USING DELTA CLUSTER BY (run_id, created)
 TBLPROPERTIES ('functional_audit.write_class' = 'system');
 
+ALTER TABLE ${CATALOG}.${SCHEMA}.lineage_observed ADD CONSTRAINT ck_lineage_level
+  CHECK (level IN ('TABLE', 'COLUMN'));
+
+ALTER TABLE ${CATALOG}.${SCHEMA}.lineage_observed ADD CONSTRAINT ck_lineage_direction
+  CHECK (direction IN ('READ', 'WRITE'));
+
+ALTER TABLE ${CATALOG}.${SCHEMA}.lineage_observed ADD CONSTRAINT ck_lineage_match
+  CHECK (match_method IN ('ENTITY', 'TAG', 'WINDOW'));
+
 CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.query_observed (
   run_id               STRING NOT NULL,
   statement_id         STRING NOT NULL,
@@ -162,6 +196,10 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.query_observed (
 USING DELTA CLUSTER BY (run_id, created)
 TBLPROPERTIES ('functional_audit.write_class' = 'system');
 
+ALTER TABLE ${CATALOG}.${SCHEMA}.query_observed ADD CONSTRAINT ck_query_match
+  CHECK (match_method IN ('ENTITY', 'TAG', 'WINDOW'));
+
+-- system, re-graded in place ---------------------------------------------------
 CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.reconciliations (
   run_id        STRING  NOT NULL,
   stage         STRING  NOT NULL,     -- PROVISIONAL | FINAL
@@ -173,6 +211,12 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.reconciliations (
 )
 USING DELTA CLUSTER BY (run_id)
 TBLPROPERTIES (delta.enableChangeDataFeed = true, 'functional_audit.write_class' = 'system');
+
+ALTER TABLE ${CATALOG}.${SCHEMA}.reconciliations ADD CONSTRAINT ck_reconciliations_stage
+  CHECK (stage IN ('PROVISIONAL', 'FINAL'));
+
+ALTER TABLE ${CATALOG}.${SCHEMA}.reconciliations ADD CONSTRAINT ck_reconciliations_status
+  CHECK (status IN ('ATTESTED', 'DEVIATION', 'ERROR'));
 
 CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}._migrations (
   version     STRING NOT NULL,

@@ -58,3 +58,54 @@ FROM ${CATALOG}.${SCHEMA}.runs r
 JOIN ${CATALOG}.${SCHEMA}.contracts c
   ON c.contract_id = r.contract_id AND c.contract_version = r.contract_version
 LEFT JOIN ${CATALOG}.${SCHEMA}.reconciliations x ON x.run_id = r.run_id;
+
+-- metric view over the ledger for dashboards and Genie: SELECT calculation_id, MEASURE(runs) ... GROUP BY ...
+CREATE OR REPLACE VIEW ${CATALOG}.${SCHEMA}.ledger_metrics
+WITH METRICS
+LANGUAGE YAML
+AS $$
+version: 0.1
+source: ${CATALOG}.${SCHEMA}.ledger
+dimensions:
+  - name: calculation_id
+    expr: calculation_id
+  - name: contract_id
+    expr: contract_id
+  - name: contract_version
+    expr: contract_version
+  - name: requirement_id
+    expr: requirement_id
+  - name: run_kind
+    expr: run_kind
+  - name: run_purpose
+    expr: run_purpose
+  - name: reporting_period
+    expr: reporting_period
+  - name: run_status
+    expr: status
+  - name: reconciliation_stage
+    expr: reconciliation_stage
+  - name: reconciliation_status
+    expr: reconciliation_status
+  - name: run_as_principal
+    expr: run_as_principal
+  - name: started_on
+    expr: to_date(started_at)
+measures:
+  - name: runs
+    expr: count(1)
+  - name: runs_succeeded
+    expr: count_if(status = 'SUCCEEDED')
+  - name: runs_quarantined
+    expr: count_if(status = 'QUARANTINED')
+  - name: runs_failed
+    expr: count_if(status IN ('FAILED', 'ABANDONED'))
+  - name: runs_final
+    expr: count_if(reconciliation_stage = 'FINAL')
+  - name: runs_with_deviation
+    expr: count_if(reconciliation_status = 'DEVIATION')
+  - name: distinct_logic_hashes
+    expr: count(distinct logic_hash_executed)
+  - name: median_duration_seconds
+    expr: percentile_approx(unix_timestamp(ended_at) - unix_timestamp(started_at), 0.5)
+$$;

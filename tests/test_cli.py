@@ -42,7 +42,7 @@ def test_init_renders_migrations_and_grants_without_a_session(tmp_path):
                                   "--grant-writer", "sp-fa-writer", "--grant-reader", "analysts", "--grant-reader", "auditors"])
     assert r.exit_code == 0, r.output
     files = sorted(p.name for p in (tmp_path / "sql").iterdir())
-    assert files == ["V001__schema.sql", "V002__explain.sql", "grants.sql"]
+    assert files == ["V001__schema.sql", "V002__explain.sql", "V003__databricks.sql", "grants.sql"]
     v1 = (tmp_path / "sql" / "V001__schema.sql").read_text()
     assert "gov.fa.runs" in v1 and "${" not in v1
     grants = (tmp_path / "sql" / "grants.sql").read_text()

@@ -88,6 +88,39 @@ functional_audit/
 examples/         rwa_retail bundle + stages
 ```
 
+## Data model — `platform_gov.functional_audit`
+
+```
+contracts            [human-tracked]     PK (contract_id, contract_version)
+  └─< contract_deps  [system, append]    FK (contract_id, contract_version)   direction, object_name, pin_mode
+  └─< runs           [system]            PK (run_id), FK (contract_id, contract_version)
+        ├─< run_inputs        [system, append]   object_name, delta_version, num_records, pin_mode, declared
+        ├─< run_outputs       [system, append]   object_name, commit_version, num_rows
+        ├─< evidence          [system, append]   evidence_type, payload (VARIANT)
+        ├─< lineage_observed  [system, append]   level, direction, source/target object+column, match_method
+        ├─< query_observed    [system, append]   statement_id, event_time, rows_produced, match_method
+        ├── reconciliations   [system, re-graded] PK (run_id)  stage, status, checks/deviations (VARIANT)
+        └─< attestations      [human-tracked]    FK (run_id) or (contract_id, period)  decision, waiver_reason
+```
+
+Derived objects: `explain(run_id)` (SQL table function over all of the above), `functional_audit_views.<catalog>__<schema>__<table>`
+(business table `LEFT JOIN LATERAL explain(__run_id)`, audit columns prefixed `fa_`), `ledger` (view) and `ledger_metrics`
+(metric view over runs + contracts + reconciliations for dashboards and Genie).
+
+Audit-column convention, matching UC `information_schema`: human-touched tables carry `created, created_by, last_altered,
+last_altered_by`; system tables carry `created` only; `reconciliations` is the one system table re-graded in place and
+carries `created + last_altered` with no `_by`. The SDK never deletes from any of these tables. Enumerated columns
+(`status`, `run_kind`, `run_purpose`, `direction`, `level`, `match_method`, `stage`, `decision`, …) are `CHECK`-constrained
+on every engine; the primary/foreign keys above are applied as UC informational constraints by the Databricks-only migration
+`V003`, together with the `plans` volume behind `runs.plan_proto_path`. `tests/test_er_compliance.py` checks the migrated
+schema against this model.
+
+Two deliberate readings of the model: `runs` is append-only in the sense that rows are never removed, but the SDK completes
+a row in place (`RUNNING` → `SUCCEEDED | QUARANTINED | FAILED`, `ended_at`, hashes, commit version) and `fa reconcile`
+advances `attestation_stage`, which is what those columns are for; and `runs.binding_hash` is the one column added to the
+model, so that a parameter change and a logic change stay distinguishable at a glance. Everything else the runtime learns
+about a plan (canonical text, lifted literals, analyzed and optimized plans) is `evidence` of type `plan`.
+
 # functional_audit — FAQ
 
 ## Purpose

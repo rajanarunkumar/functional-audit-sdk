@@ -11,6 +11,7 @@ import functools
 import inspect
 import json
 import logging
+import os
 import traceback
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -150,6 +151,22 @@ def _quarantine(spark, store: Store, s: Settings, target: str, run_id: str) -> s
     return q
 
 
+def _write_plan_proto(s: Settings, run_id: str, proto: bytes | None) -> str | None:
+    """Serialized plan to the plans directory (a UC volume on Databricks). Best effort: the
+    canonical plan text in the evidence table is the record of what executed."""
+    if not proto:
+        return None
+    path = os.path.join(s.plans_dir, f"{run_id}.pb")
+    try:
+        os.makedirs(s.plans_dir, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(proto)
+        return path
+    except OSError as e:
+        log.info("plan proto not written to %s: %s", path, type(e).__name__)
+        return None
+
+
 def _metric(commit, key):
     try:
         return int(commit["operationMetrics"].get(key)) if commit else None
@@ -226,7 +243,7 @@ def _execute(contract_id, fn, args, kwargs, opts: RunOptions, spark, local_contr
         "run_kind": opts.run_kind.value, "run_purpose": opts.run_purpose.value,
         "scenario_id": opts.scenario_id, "scenario_params": params or None,
         "backfill_id": opts.backfill_id, "supersedes_run_id": opts.supersedes_run_id,
-        "reporting_period": opts.reporting_period, "code_hash": code_hash, "code_hash_source": code_hash_source,
+        "reporting_period": opts.reporting_period, "code_hash": code_hash,
         **{k: v for k, v in ctx.as_dict().items() if k != "conf_snapshot"},
         "conf_snapshot": ctx.conf_snapshot, "query_tag": query_tag,
         "started_at": started, "status": "RUNNING", "attestation_stage": None,
@@ -324,15 +341,17 @@ def _execute(contract_id, fn, args, kwargs, opts: RunOptions, spark, local_contr
         ev.add("observe", {"tier": tier, "metrics": metrics, "source": metrics_source})
         if commit:
             ev.add("delta_ops", commit)
-        ev.add("context", ctx.as_dict())
+        ev.add("context", {**ctx.as_dict(), "code_hash_source": code_hash_source})
         ev.add("controls", {"results": control_results})
         if ident:
-            ev.add("plan", {"analyzed": ident.analyzed_text, "optimized": ident.optimized_text})
+            ev.add("plan", {"structure_hash": ident.structure_hash, "binding_hash": binding, "canonical": ident.canonical_text,
+                            "literals": ident.literals, "analyzed": ident.analyzed_text, "optimized": ident.optimized_text})
+        plan_proto_path = _write_plan_proto(s, run_id, proto)
         persist("evidence", store.flush, ev)
         persist("reconciliation", store.upsert_reconciliation, run_id, "PROVISIONAL", rec.status, rec.checks, rec.deviations)
         persist("run status", store.update_run, run_id, status=status, ended_at=datetime.now(timezone.utc),
                 logic_hash_executed=ident.structure_hash if ident else None, binding_hash=binding,
-                plan_text=ident.canonical_text if ident else None, literals=ident.literals if ident else None,
+                plan_proto_path=plan_proto_path,
                 plan_proto=proto if proto and len(proto) <= s.plan_inline_max_bytes else None,
                 output_commit_version=commit["version"] if commit else None, attestation_stage="PROVISIONAL")
         if (ident and status == "SUCCEEDED" and rec.status == "ATTESTED" and contract.logic_hash_declared is None

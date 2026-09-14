@@ -73,9 +73,10 @@ def lock(contracts: Path):
 @click.option("--render-to", type=click.Path(path_type=Path), default=None, help="Write rendered SQL to a directory instead of executing")
 @click.option("--grant-writer", default=None, help="Principal the SDK writes evidence as (SELECT, MODIFY on the schema)")
 @click.option("--grant-reader", multiple=True, help="Principal/group that may read evidence and explain views")
+@click.option("--databricks/--no-databricks", default=None, help="Apply Databricks-only migrations (default: detect)")
 @click.option("--skip-preconditions", is_flag=True)
-def init(catalog, schema, dry_run, render_to, grant_writer, grant_reader, skip_preconditions):
-    """Create/upgrade the system schema, tables, explain() TVF, ledger view, grants. Run from CI/CD."""
+def init(catalog, schema, dry_run, render_to, grant_writer, grant_reader, databricks, skip_preconditions):
+    """Create/upgrade the system schema, tables, constraints, explain() TVF, ledger views, grants. Run from CI/CD."""
     from functional_audit.init import migrate
     s = _settings(catalog, schema)
     grants = migrate.grant_statements(s, grant_writer, list(grant_reader))
@@ -89,7 +90,7 @@ def init(catalog, schema, dry_run, render_to, grant_writer, grant_reader, skip_p
         return
     spark = _spark()
     try:
-        applied = migrate.apply(spark, s, __version__, dry_run=dry_run)
+        applied = migrate.apply(spark, s, __version__, dry_run=dry_run, databricks=databricks)
     except migrate.MigrationError as e:
         raise click.ClickException(str(e))
     click.echo(("planned" if dry_run else "applied") + f" migrations: {applied or 'none'}")

@@ -76,8 +76,15 @@ def test_clean_run_writes_evidence_and_seals_the_contract(delta, audit_schema, p
     out = fa.stage("ead_calc.ead")(build)(run=fa.RunOptions(reporting_period="2027-03-31"), spark=delta)
     run_id = out.__fa_run_id__
     row = _run_of(delta, audit_schema, run_id)
-    assert row["status"] == "SUCCEEDED" and row["attestation_stage"] == "PROVISIONAL" and row["code_hash_source"] == "source"
-    assert row["logic_hash_executed"] and row["binding_hash"] and "Join LeftOuter" in row["plan_text"]
+    assert row["status"] == "SUCCEEDED" and row["attestation_stage"] == "PROVISIONAL"
+    assert row["logic_hash_executed"] and row["binding_hash"] and row["code_hash"]
+    plan = json.loads(delta.sql(f"SELECT to_json(payload) FROM {audit_schema.table('evidence')} "
+                                f"WHERE run_id = '{run_id}' AND evidence_type = 'plan'").collect()[0][0])
+    assert "Join LeftOuter" in plan["canonical"] and plan["structure_hash"] == row["logic_hash_executed"]
+    assert "2027-03-31" in plan["literals"] and "Relation" in plan["analyzed"]
+    context = json.loads(delta.sql(f"SELECT to_json(payload) FROM {audit_schema.table('evidence')} "
+                                   f"WHERE run_id = '{run_id}' AND evidence_type = 'context'").collect()[0][0])
+    assert context["code_hash_source"] == "source"
     assert row["output_commit_version"] is not None and row["query_tag"].startswith(f"fa_run_id:{run_id}")
     written = delta.table("cap_gold.ead").where(F.col("__run_id") == run_id)
     assert written.count() == 60 and "__run_id" in written.columns

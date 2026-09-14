@@ -66,17 +66,21 @@ def diff_runs(run_a: str, run_b: str, spark=None) -> dict:
     s = Settings.from_spark(spark)
     rows = (spark.table(s.table("runs")).where(F.col("run_id").isin(run_a, run_b))
                  .select("run_id", "contract_id", "contract_version", "logic_hash_executed", "binding_hash",
-                         F.to_json("literals").alias("literals"), F.to_json("scenario_params").alias("scenario_params"),
+                         F.to_json("scenario_params").alias("scenario_params"),
                          "reporting_period", F.to_json("conf_snapshot").alias("conf_snapshot"), "scenario_id").collect())
     r = {x["run_id"]: x.asDict() for x in rows}
     if len(r) != 2:
         raise ValueError("both runs must exist")
+    plans = (spark.table(s.table("evidence")).where(F.col("run_id").isin(run_a, run_b) & (F.col("evidence_type") == "plan"))
+                  .select("run_id", F.to_json("payload").alias("payload")).collect())
+    for p in plans:
+        r[p["run_id"]]["literals"] = json.loads(p["payload"]).get("literals")
     a, b = r[run_a], r[run_b]
     ins = (spark.table(s.table("run_inputs")).where(F.col("run_id").isin(run_a, run_b) & F.col("declared"))
                 .select("run_id", "object_name", "delta_version").collect())
     ia = {x["object_name"]: x["delta_version"] for x in ins if x["run_id"] == run_a}
     ib = {x["object_name"]: x["delta_version"] for x in ins if x["run_id"] == run_b}
-    la, lb = _as_list(a["literals"]), _as_list(b["literals"])
+    la, lb = _as_list(a.get("literals")), _as_list(b.get("literals"))
     pa, pb = _as_dict(a["scenario_params"]), _as_dict(b["scenario_params"])
     ca, cb = _as_dict(a["conf_snapshot"]), _as_dict(b["conf_snapshot"])
     return {

@@ -36,11 +36,16 @@ class Settings:
     enforce: str = "warn"            # warn | strict
     run_id_column: str = "__run_id"
     plan_inline_max_bytes: int = 256 * 1024
+    plans_path: str = ""             # directory for serialized plans; default /Volumes/<catalog>/<schema>/plans
     abandon_after_hours: int = 12    # RUNNING rows older than this are marked ABANDONED by fa reconcile
 
     @property
     def fq_schema(self) -> str:
         return f"{self.catalog}.{self.schema}"
+
+    @property
+    def plans_dir(self) -> str:
+        return self.plans_path or f"/Volumes/{self.catalog}/{self.schema}/plans"
 
     def table(self, name: str) -> str:
         return f"{self.fq_schema}.{check_identifier(name, 'table')}"
@@ -70,6 +75,7 @@ class Settings:
             s.telemetry_tier = int(get("telemetry.tier", s.telemetry_tier))
             s.enforce = get("enforce", s.enforce)
             s.run_id_column = get("run_id_column", s.run_id_column)
+            s.plans_path = get("plans.path", s.plans_path)
             s.abandon_after_hours = int(get("abandon_after_hours", s.abandon_after_hours))
         except Exception:  # pragma: no cover - conf access differences between runtimes
             pass
@@ -84,5 +90,6 @@ class Settings:
         s.contracts_path = os.getenv("FA_CONTRACTS_PATH", s.contracts_path)
         s.enforce = os.getenv("FA_ENFORCE", s.enforce)
         s.run_id_column = os.getenv("FA_RUN_ID_COLUMN", s.run_id_column)
+        s.plans_path = os.getenv("FA_PLANS_PATH", s.plans_path)
         s.telemetry_tier = int(os.getenv("FA_TELEMETRY_TIER", s.telemetry_tier))
         return s.validate()

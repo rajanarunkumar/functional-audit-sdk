@@ -1,0 +1,74 @@
+# Bundle: all stages of the retail RWA calculation under the US Standardized Approach.
+# Risk weights are illustrative; real parameters live in versioned reference tables.
+calculation_id: rwa_retail
+bundle_version: 2
+effective_from: 2027-01-01
+stages:
+  - contract_id: rwa_retail.ead
+    requirement_id: REQ-CAP-0201
+    rule_citation: "12 CFR 217.32; SA NPR (2026-03-19) proposed amendments"
+    business_logic: >
+      Exposure at default for retail exposures: drawn balance plus credit conversion
+      factor times undrawn commitment, by facility type.
+    inputs:
+      - object: cap_silver.retail.exposures
+        pin: latest
+        key: [exposure_id]
+      - object: cap_ref.capital.ccf_offbalance
+        pin: contract_effective
+    outputs:
+      - object: cap_gold.retail.ead
+        key: [exposure_id, reporting_period]
+    controls:
+      - id: C1
+        expr: ead >= 0
+        on_fail: fail
+      - id: C2
+        type: uniqueness
+        expr: exposure_id, reporting_period
+        on_fail: fail
+    telemetry:
+      tier: 1
+      numeric_cols: [ead]
+      distinct_col: exposure_id
+    change_log:
+      "2": "CCF table now pinned to contract effective date"
+
+  - contract_id: rwa_retail.risk_weight
+    requirement_id: REQ-CAP-0202
+    rule_citation: "SA NPR §32(g) residential mortgage LTV bands; junior-lien rollup"
+    business_logic: >
+      Risk weight for first-lien residential mortgages by LTV band from the effective
+      reference table. A junior lien held with the bank's own first lien receives the
+      first-lien band. Regulatory retail other exposures use the flat retail weight.
+    inputs:
+      - object: cap_gold.retail.ead
+        pin: latest
+      - object: cap_ref.capital.rw_resi_ltv
+        pin: contract_effective
+      - object: cap_silver.retail.property_valuations
+        pin: latest
+    outputs:
+      - object: cap_gold.retail.rwa
+        key: [exposure_id, reporting_period]
+    controls:
+      - id: C1
+        expr: ltv IS NULL OR (ltv >= 0 AND ltv <= 2)
+        on_fail: fail
+      - id: C2
+        expr: rw > 0
+        on_fail: fail
+      - id: C3
+        expr: NOT (lien_position = 'JUNIOR' AND first_lien_owned = false AND rw < 1.0)
+        description: junior-lien rollup only when the first lien is owned
+        on_fail: fail
+    telemetry:
+      tier: 2
+      numeric_cols: [ead, rwa]
+      hash_cols: [ead, rw, rwa]
+    parameters:
+      - name: rw_resi_ltv_version
+        type: int
+        description: override the LTV band table version for WHAT_IF runs
+    change_log:
+      "2": "flat 50% first-lien weight replaced by LTV band lookup per 2026 SA NPR"

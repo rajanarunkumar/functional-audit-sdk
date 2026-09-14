@@ -1,0 +1,1 @@
+import os; os.getenv("FA_AUTOLOAD_DISABLE") or __import__("functional_audit.autoload.hook")

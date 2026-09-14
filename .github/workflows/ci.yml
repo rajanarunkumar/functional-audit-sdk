@@ -1,0 +1,32 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -e ".[dev]"
+      - name: fa validate (CI gate)
+        run: fa validate --contracts examples/contracts --code examples
+      - name: unit tests
+        run: pytest -q
+  publish:
+    if: github.ref == 'refs/heads/main'
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -e . databricks-connect
+      - name: fa init (platform principal)
+        env: { DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}, DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }} }
+        run: fa init --catalog platform_gov --schema functional_audit
+      - name: fa publish
+        env: { DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}, DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }} }
+        run: fa publish --contracts examples/contracts --source-commit ${{ github.sha }}

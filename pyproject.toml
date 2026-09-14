@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "functional-audit-sdk"
+version = "0.1.0"
+description = "Transformation contract and evidence framework for Spark / Databricks (functional_audit)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+dependencies = [
+  "pydantic>=2.5",
+  "pyyaml>=6.0",
+  "click>=8.1",
+]
+
+[project.optional-dependencies]
+spark = ["pyspark[connect]>=4.0"]
+dev = ["pytest>=8", "pytest-cov", "ruff"]
+
+[project.scripts]
+fa = "functional_audit.cli:main"
+
+[project.entry-points.pytest11]
+functional_audit = "functional_audit.testing.plugin"
+
+[tool.setuptools.packages.find]
+include = ["functional_audit*"]
+
+[tool.setuptools.package-data]
+functional_audit = ["init/migrations/*.sql", "autoload/*.pth"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

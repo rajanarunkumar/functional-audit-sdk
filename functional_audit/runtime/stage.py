@@ -1,27 +1,31 @@
 """@fa.stage — the only authoring surface. Sequence:
 
- 1. run_id, resolve contract           5. build df, hash plan, attach observe()
- 2. capture context, write runs row    6. write output with __run_id + commit metadata
- 3. set query tags                     7. evidence + controls
- 4. pin inputs                         8. provisional reconciliation
+ 1. resolve contract, bind parameters       6. reconcile (pre-write); strict refuses to write
+ 2. capture context, write runs row         7. write output with __run_id + commit metadata
+ 3. set query tags                          8. controls on the written rows; reconcile (post-write)
+ 4. pin inputs, check upstream state        9. quarantine this run's rows if controls require it
+ 5. build df, identify plan                10. flush evidence; seal the contract plan on first clean run
 """
 from __future__ import annotations
 import functools
 import inspect
 import json
-import time
+import logging
 import traceback
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
-from functional_audit.config import RESERVED_PREFIX, Settings
-from functional_audit.contracts.model import Contract, RunKind, RunPurpose
+from functional_audit.config import RESERVED_PREFIX, Settings, check_fqn
+from functional_audit.contracts.model import Contract, PinMode, RunKind, RunPurpose
 from functional_audit.ids import uuid7, text_hash
 from functional_audit.runtime import context as ctxmod, plan_hash, telemetry, controls as ctlmod, reconcile
-from functional_audit.runtime.store import Store
+from functional_audit.runtime.store import Store, RunEvidence
+
+log = logging.getLogger("functional_audit.stage")
 
 _QUERY_TAG_CONF = "spark.databricks.queryTags"
 _USER_META_CONF = "spark.databricks.delta.commitInfo.userMetadata"
+QUARANTINE_SUFFIX = "__quarantine"
 
 
 class StageError(RuntimeError):
@@ -29,8 +33,20 @@ class StageError(RuntimeError):
 
 
 class Inputs(dict):
-    """Mapping object_name -> DataFrame, resolved and pinned by the SDK."""
-    versions: dict[str, Optional[int]]
+    """object_name -> DataFrame. Declared inputs are pinned by the SDK before the stage runs;
+    any other name resolves unpinned and is recorded as an undeclared read."""
+
+    def __init__(self, spark):
+        super().__init__()
+        self._spark = spark
+        self.versions: dict[str, Optional[int]] = {}
+        self.undeclared: set[str] = set()
+
+    def __missing__(self, name: str):
+        self.undeclared.add(name)
+        df = self._spark.table(name)
+        self[name] = df
+        return df
 
 
 class RunOptions:
@@ -70,153 +86,74 @@ def stage(contract_id: str, *, local_contract: Optional[Contract] = None):
 def sql(query: str, *, contract_id: str, run: Optional[RunOptions] = None, spark=None,
         local_contract: Optional[Contract] = None):
     def _fn(inputs, **_):
-        return _get_spark().sql(query)
+        return inputs._spark.sql(query)
     _fn.__name__ = f"sql_{contract_id}"
     _fn.__fa_source__ = query
     return _execute(contract_id, _fn, (), {}, run or RunOptions(), spark, local_contract)
 
 
-def _execute(contract_id, fn, args, kwargs, opts: RunOptions, spark, local_contract):
-    spark = spark or _get_spark()
-    s = Settings.from_spark(spark)
-    if not s.enabled:
-        return fn(Inputs(), *args, **kwargs)
-    store = Store(spark, s)
-    run_id = uuid7()
+# --- helpers ---------------------------------------------------------------------
 
-    # 1. contract
-    contract = local_contract or store.resolve_contract(contract_id, opts.reporting_period)
-    if contract is None:
-        msg = f"no effective contract for '{contract_id}' (period={opts.reporting_period})"
-        if s.enforce == "strict":
-            raise StageError(msg)
-        contract = None
-    if contract and opts.scenario_params:
-        allowed = {p.name for p in contract.parameters}
-        bad = set(opts.scenario_params) - allowed
-        if bad:
-            raise StageError(f"scenario overrides not declared in contract parameters: {sorted(bad)}")
+def _bind_parameters(contract: Contract, opts: RunOptions) -> dict:
+    allowed = {p.name for p in contract.parameters}
+    bad = set(opts.scenario_params) - allowed
+    if bad:
+        raise StageError(f"scenario overrides not declared in contract parameters: {sorted(bad)}")
+    return {**contract.parameter_defaults(), **opts.scenario_params}
 
-    # 2. context + runs row (before any data is read)
-    ctx = ctxmod.capture(spark, contract.semantics.confs if contract else None)
-    started = datetime.now(timezone.utc)
-    query_tag = f"fa_run_id={run_id};fa_contract={contract_id};fa_ver={contract.contract_version if contract else 0}"
+
+def _accepted_kwargs(fn: Callable, params: dict, given: dict) -> dict:
+    """Contract parameters the stage function can receive, never overriding explicit kwargs."""
     try:
-        src = getattr(fn, "__fa_source__", None) or inspect.getsource(fn)
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return {}
+    takes_var = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    return {k: v for k, v in params.items() if k not in given and (takes_var or k in sig.parameters)}
+
+
+def _source_hash(fn: Callable) -> tuple[str, str]:
+    src = getattr(fn, "__fa_source__", None)
+    if src is not None:
+        return text_hash(src), "source"
+    try:
+        return text_hash(inspect.getsource(fn)), "source"
     except (OSError, TypeError):
-        src = fn.__name__
-    code_hash = text_hash(src)
-    store.insert_run({
-        "run_id": run_id, "contract_id": contract_id,
-        "contract_version": contract.contract_version if contract else 0,
-        "run_kind": opts.run_kind.value, "run_purpose": opts.run_purpose.value,
-        "scenario_id": opts.scenario_id, "scenario_params": opts.scenario_params or None,
-        "backfill_id": opts.backfill_id, "supersedes_run_id": opts.supersedes_run_id,
-        "reporting_period": opts.reporting_period, "code_hash": code_hash,
-        **{k: v for k, v in ctx.as_dict().items() if k != "conf_snapshot"},
-        "conf_snapshot": ctx.conf_snapshot, "query_tag": query_tag,
-        "started_at": started, "status": "RUNNING", "attestation_stage": None,
-    })
+        return text_hash(fn.__name__), "name"
 
-    # 3. query tags
-    prev_tag = _safe_get(spark, _QUERY_TAG_CONF)
-    prev_meta = _safe_get(spark, _USER_META_CONF)
-    _safe_set(spark, _QUERY_TAG_CONF, query_tag)
 
-    try:
-        # 4. pin inputs
-        inputs = Inputs()
-        inputs.versions = {}
-        input_rows = []
-        for i in (contract.inputs if contract else []):
-            ver = opts.input_versions.get(i.object)
-            if ver is None and i.pin.value != "explicit":
-                ver = store.latest_version(i.object)
-            df_in = spark.read.format("delta").option("versionAsOf", ver).table(i.object) if ver is not None else spark.table(i.object)
-            inputs[i.object] = df_in
-            inputs.versions[i.object] = ver
-            input_rows.append({"object_name": i.object, "delta_version": ver, "pin_mode": i.pin.value, "declared": True})
-        store.insert_inputs(run_id, input_rows)
-
-        # 5. build + hash + observe
-        df = fn(inputs, *args, **kwargs)
-        if df is None:
-            raise StageError("stage function returned None; it must return a DataFrame")
-        bad = [c for c in df.columns if c.startswith(RESERVED_PREFIX)]
-        if bad:
-            raise StageError(f"stage produced reserved columns {bad}; the SDK owns '{RESERVED_PREFIX}*'")
-        lh, plan_txt = plan_hash.logic_hash(df)
-        observed_reads = plan_hash.relations_in_plan(plan_txt)
-        proto = plan_hash.plan_proto_bytes(df)
-
-        tier, downgraded = telemetry.effective_tier(contract.telemetry.tier if contract else 0, s.telemetry_tier, False)
-        t0 = time.time()
-        df_obs, obs = telemetry.attach(df, contract.telemetry, tier) if contract else (df, None)
-
-        # 6. write
-        from pyspark.sql import functions as F
-        out = contract.outputs[0].object if contract else None
-        written = set()
-        commit = None
-        if out:
-            target = out + _purpose_suffix(opts.run_purpose)
-            _safe_set(spark, _USER_META_CONF, json.dumps({"run_id": run_id, "contract_id": contract_id,
-                                                          "contract_version": contract.contract_version, "logic_hash": lh}))
-            df_out = df_obs.withColumn(s.run_id_column, F.lit(run_id))
-            writer = df_out.write.format("delta").mode(opts.write_mode).option("mergeSchema", "true")
-            writer.saveAsTable(target)
-            commit = store.last_commit(target)
-            written.add(out)
-            num_rows = _metric(commit, "numOutputRows")
-            store.insert_output(run_id, target, commit["version"] if commit else None, num_rows)
-            _sync_view(spark, s, target)
+def _resolve_input(spark, store: Store, i, opts: RunOptions, contract: Contract):
+    """Returns (df, version, gap) where gap names the evidence that could not be captured."""
+    ver = opts.input_versions.get(i.object)
+    gap = None
+    if ver is None:
+        if i.pin == PinMode.explicit:
+            gap = f"input version for {i.object} (pin: explicit, none supplied)"
+        elif i.pin == PinMode.contract_effective:
+            ts = datetime.combine(contract.effective_from, datetime.min.time(), tzinfo=timezone.utc)
+            ver = store.version_as_of(i.object, ts)
+            gap = None if ver is not None else f"input version for {i.object} as of {contract.effective_from}"
         else:
-            df_obs.count()
+            ver = store.latest_version(i.object)
+            gap = None if ver is not None else f"input version for {i.object}"
+    if ver is None:
+        return spark.table(i.object), None, gap
+    return spark.read.format("delta").option("versionAsOf", ver).table(i.object), ver, gap
 
-        # 7. evidence
-        obs_res = telemetry.collect(obs, tier, t0)
-        store.insert_evidence(run_id, "observe", {"tier": tier, "metrics": obs_res.metrics,
-                                                  "overhead_ms": obs_res.overhead_ms, "downgraded_from": downgraded})
-        if commit:
-            store.insert_evidence(run_id, "delta_ops", commit)
-        store.insert_evidence(run_id, "context", ctx.as_dict())
-        control_results = ctlmod.evaluate(df_obs, contract, spark) if contract and contract.controls else []
-        store.insert_evidence(run_id, "controls", {"results": control_results})
-        if proto and len(proto) <= s.plan_inline_max_bytes:
-            store.update_run(run_id, plan_proto_path=None)
-        undeclared = observed_reads - {i.object for i in (contract.inputs if contract else [])}
-        store.insert_inputs(run_id, [{"object_name": o, "declared": False} for o in sorted(undeclared)
-                                     if not o.startswith("system.") and ".functional_audit." not in o])
 
-        # 8. provisional reconciliation
-        rec = reconcile.provisional(
-            contract, logic_hash_executed=lh, logic_hash_declared=None,
-            declared_inputs={i.object for i in contract.inputs}, observed_reads=observed_reads,
-            declared_outputs={o.object for o in contract.outputs}, written_outputs=written,
-            control_results=control_results, conf_snapshot=ctx.conf_snapshot,
-            telemetry_downgraded_from=downgraded) if contract else reconcile.ReconcileResult("ERROR", {}, [{"code": "MISSING_CONTRACT"}])
-        store.upsert_reconciliation(run_id, "PROVISIONAL", rec.status, rec.checks, rec.deviations)
-        store.update_run(run_id, status="SUCCEEDED", ended_at=datetime.now(timezone.utc),
-                         logic_hash_executed=lh, output_commit_version=commit["version"] if commit else None,
-                         attestation_stage="PROVISIONAL")
-        if rec.status == "DEVIATION" and s.enforce == "strict":
-            raise StageError(f"run {run_id} has deviations: {[d['code'] for d in rec.deviations]}")
-        df_obs.__fa_run_id__ = run_id
-        return df_obs
-    except Exception as e:
-        store.update_run(run_id, status="FAILED", ended_at=datetime.now(timezone.utc))
-        store.insert_evidence(run_id, "error", {"type": type(e).__name__, "message": str(e),
-                                                "trace": traceback.format_exc()[-4000:]})
-        raise
-    finally:
-        _safe_set(spark, _QUERY_TAG_CONF, prev_tag)
-        _safe_set(spark, _USER_META_CONF, prev_meta)
+def _quarantine(spark, store: Store, s: Settings, target: str, run_id: str) -> str:
+    """Move this run's rows out of the governed table into <target>__quarantine."""
+    from pyspark.sql import functions as F
+    q = target + QUARANTINE_SUFFIX
+    spark.table(target).where(F.col(s.run_id_column) == run_id).write.format("delta").mode("append").saveAsTable(q)
+    store.delete_run_rows(target, run_id)
+    return q
 
 
 def _metric(commit, key):
     try:
         return int(commit["operationMetrics"].get(key)) if commit else None
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
@@ -233,19 +170,191 @@ def _safe_set(spark, k, v):
             spark.conf.unset(k)
         else:
             spark.conf.set(k, v)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("could not set %s: %s", k, type(e).__name__)
 
 
-def _sync_view(spark, s: Settings, table: str) -> None:
-    """Create the explain view for a governed table once (guarded by a table property)."""
-    from functional_audit.runtime.explain import view_sql, view_name
+class _Persist:
+    """Evidence writes: fatal under strict, logged under warn so a governance outage
+    never takes a production job down with it."""
+
+    def __init__(self, strict: bool):
+        self.strict, self.failed = strict, []
+
+    def __call__(self, what: str, fn, *a, **kw):
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            if self.strict:
+                raise StageError(f"could not persist {what}: {e}") from e
+            log.exception("functional_audit: could not persist %s", what)
+            self.failed.append(what)
+            return None
+
+
+# --- the stage ------------------------------------------------------------------
+
+def _execute(contract_id, fn, args, kwargs, opts: RunOptions, spark, local_contract):
+    spark = spark or _get_spark()
+    s = Settings.from_spark(spark)
+    if not s.enabled:
+        log.warning("functional_audit disabled; %s runs ungoverned", contract_id)
+        return fn(Inputs(spark), *args, **kwargs)
+    strict = s.enforce == "strict"
+    store = Store(spark, s)
+    persist = _Persist(strict)
+    run_id = uuid7()
+
+    # 1. contract + parameters
+    contract = local_contract or store.resolve_contract(contract_id, opts.reporting_period, opts.as_of_contract_version)
+    if contract is None:
+        msg = f"no effective contract for '{contract_id}' (period={opts.reporting_period}, version={opts.as_of_contract_version})"
+        if strict:
+            raise StageError(msg)
+        log.warning("functional_audit: %s; running ungoverned", msg)
+        return fn(Inputs(spark), *args, **kwargs)
+    params = _bind_parameters(contract, opts)
+    fn_kwargs = {**kwargs, **_accepted_kwargs(fn, params, kwargs)}
+
+    # 2. context + runs row (before any data is read)
+    ctx = ctxmod.capture(spark, contract.semantics.confs)
+    started = datetime.now(timezone.utc)
+    query_tag = f"fa_run_id:{run_id},fa_contract:{contract_id},fa_ver:{contract.contract_version}"
+    code_hash, code_hash_source = _source_hash(fn)
+    persist("runs row", store.insert_run, {
+        "run_id": run_id, "contract_id": contract_id, "contract_version": contract.contract_version,
+        "run_kind": opts.run_kind.value, "run_purpose": opts.run_purpose.value,
+        "scenario_id": opts.scenario_id, "scenario_params": params or None,
+        "backfill_id": opts.backfill_id, "supersedes_run_id": opts.supersedes_run_id,
+        "reporting_period": opts.reporting_period, "code_hash": code_hash, "code_hash_source": code_hash_source,
+        **{k: v for k, v in ctx.as_dict().items() if k != "conf_snapshot"},
+        "conf_snapshot": ctx.conf_snapshot, "query_tag": query_tag,
+        "started_at": started, "status": "RUNNING", "attestation_stage": None,
+    })
+    ev = RunEvidence(run_id)
+    incomplete: list[str] = []
+
+    # 3. query tags
+    prev_tag, prev_meta = _safe_get(spark, _QUERY_TAG_CONF), _safe_get(spark, _USER_META_CONF)
+    _safe_set(spark, _QUERY_TAG_CONF, query_tag)
+    status = "FAILED"
     try:
-        props = {r[0]: r[1] for r in spark.sql(f"SHOW TBLPROPERTIES {table}").collect()}
-        if props.get("functional_audit.view_version") == "1":
-            return
-        spark.sql(view_sql(s, table))
-        spark.sql(f"ALTER TABLE {table} SET TBLPROPERTIES ('functional_audit.view_version'='1', "
-                  f"'functional_audit.view'='{view_name(s, table)}')")
-    except Exception:
-        pass
+        # 4. pin inputs, check upstream
+        inputs = Inputs(spark)
+        upstream: dict[str, dict] = {}
+        for i in contract.inputs:
+            df_in, ver, gap = _resolve_input(spark, store, i, opts, contract)
+            inputs[i.object], inputs.versions[i.object] = df_in, ver
+            if gap:
+                incomplete.append(gap)
+            ev.inputs.append({"object_name": i.object, "delta_version": ver, "pin_mode": i.pin.value, "declared": True})
+            prod = store.latest_producer(i.object)
+            if prod and (prod["status"] in reconcile.BLOCKING_RUN_STATUSES or prod.get("reconciliation_status") == "DEVIATION"):
+                upstream[i.object] = prod
+
+        # 5. build + identify
+        df = fn(inputs, *args, **fn_kwargs)
+        if df is None:
+            raise StageError("stage function returned None; it must return a DataFrame")
+        bad = [c for c in df.columns if c.startswith(RESERVED_PREFIX)]
+        if bad:
+            raise StageError(f"stage produced reserved columns {bad}; the SDK owns '{RESERVED_PREFIX}*'")
+        try:
+            ident = plan_hash.identify(df)
+        except plan_hash.PlanUnavailable as e:
+            if strict:
+                raise StageError(str(e)) from e
+            ident = None
+        proto = plan_hash.plan_proto_bytes(df)
+        observed = (ident.relations if ident else set()) | {plan_hash.canonical_name(o) for o in inputs.undeclared}
+        for o in sorted(inputs.undeclared):
+            ev.inputs.append({"object_name": o, "delta_version": None, "pin_mode": None, "declared": False})
+        binding = plan_hash.binding_hash(ident.literals if ident else [], inputs.versions, opts.reporting_period, params)
+        declared_inputs = {plan_hash.canonical_name(i.object) for i in contract.inputs}
+        linkage = "ENTITY" if ctx.entity_run_id else "WINDOW_ONLY"
+
+        # 6. pre-write reconciliation: a strict run refuses to write on any deviation it can already see
+        rec = reconcile.provisional(contract, s, structure_hash=ident.structure_hash if ident else None,
+                                    binding_hash=binding, declared_hash=contract.logic_hash_declared,
+                                    declared_inputs=declared_inputs, observed_reads=observed,
+                                    conf_snapshot=ctx.conf_snapshot, evidence_incomplete=incomplete,
+                                    upstream=upstream, linkage=linkage)
+        if strict and rec.status == "DEVIATION":
+            raise StageError(f"refusing to write: {rec.codes}", )
+
+        # 7. write
+        from pyspark.sql import functions as F
+        tier = telemetry.effective_tier(contract.telemetry.tier, s.telemetry_tier)
+        exprs = telemetry.metric_exprs(contract.telemetry, tier) + ctlmod.observe_exprs(contract)
+        df_obs, obs = telemetry.attach(df, exprs)
+        out = contract.outputs[0].object
+        target = check_fqn(out + _purpose_suffix(opts.run_purpose))
+        _safe_set(spark, _USER_META_CONF, json.dumps({"run_id": run_id, "contract_id": contract_id,
+                                                      "contract_version": contract.contract_version,
+                                                      "logic_hash": ident.structure_hash if ident else None}))
+        df_obs.withColumn(s.run_id_column, F.lit(run_id)).write.format("delta").mode(opts.write_mode).saveAsTable(target)
+        commit = store.commit_for_run(target, run_id)
+        if commit is None:
+            incomplete.append(f"commit version for {target}")
+        ev.outputs.append({"object_name": target, "commit_version": commit["version"] if commit else None,
+                           "num_rows": _metric(commit, "numOutputRows")})
+
+        # 8. controls on what was written, then the full reconciliation
+        written_df = spark.table(target).where(F.col(s.run_id_column) == run_id)
+        metrics, metrics_source = telemetry.collect(obs), "observe"
+        if obs is not None and not metrics:
+            metrics, metrics_source = telemetry.scan(written_df, telemetry.metric_exprs(contract.telemetry, tier)), "scan"
+        control_results = ctlmod.evaluate(contract, metrics, written_df, spark)
+        rec = reconcile.provisional(contract, s, structure_hash=ident.structure_hash if ident else None,
+                                    binding_hash=binding, declared_hash=contract.logic_hash_declared,
+                                    declared_inputs=declared_inputs, observed_reads=observed,
+                                    conf_snapshot=ctx.conf_snapshot, evidence_incomplete=incomplete,
+                                    upstream=upstream, linkage=linkage, control_results=control_results,
+                                    declared_outputs={out}, written_outputs={out})
+
+        # 9. quarantine
+        status = "SUCCEEDED"
+        if reconcile.should_quarantine(control_results, strict):
+            q = _quarantine(spark, store, s, target, run_id)
+            ev.outputs.append({"object_name": q, "commit_version": None, "num_rows": _metric(commit, "numOutputRows")})
+            status = "QUARANTINED"
+            rec.checks["quarantine"] = q
+
+        # 10. evidence
+        ev.add("observe", {"tier": tier, "metrics": metrics, "source": metrics_source})
+        if commit:
+            ev.add("delta_ops", commit)
+        ev.add("context", ctx.as_dict())
+        ev.add("controls", {"results": control_results})
+        if ident:
+            ev.add("plan", {"analyzed": ident.analyzed_text, "optimized": ident.optimized_text})
+        persist("evidence", store.flush, ev)
+        persist("reconciliation", store.upsert_reconciliation, run_id, "PROVISIONAL", rec.status, rec.checks, rec.deviations)
+        persist("run status", store.update_run, run_id, status=status, ended_at=datetime.now(timezone.utc),
+                logic_hash_executed=ident.structure_hash if ident else None, binding_hash=binding,
+                plan_text=ident.canonical_text if ident else None, literals=ident.literals if ident else None,
+                plan_proto=proto if proto and len(proto) <= s.plan_inline_max_bytes else None,
+                output_commit_version=commit["version"] if commit else None, attestation_stage="PROVISIONAL")
+        if (ident and status == "SUCCEEDED" and rec.status == "ATTESTED" and contract.logic_hash_declared is None
+                and local_contract is None and opts.run_purpose == RunPurpose.PRODUCTION):
+            if persist("seal", store.seal_logic_hash, contract_id, contract.contract_version, ident.structure_hash):
+                log.info("functional_audit: sealed %s v%s to plan %s", contract_id, contract.contract_version,
+                         ident.structure_hash[:12])
+        if strict and rec.status == "DEVIATION":
+            raise StageError(f"run {run_id} {status}: {rec.codes}")
+        try:
+            df_obs.__fa_run_id__ = run_id
+        except Exception:
+            pass
+        return df_obs
+    except Exception as e:
+        if status != "QUARANTINED":
+            status = "FAILED"
+        ev_err = RunEvidence(run_id)
+        ev_err.add("error", {"type": type(e).__name__, "message": str(e), "trace": traceback.format_exc()[-4000:]})
+        persist("error evidence", store.flush, ev_err)
+        persist("run status", store.update_run, run_id, status=status, ended_at=datetime.now(timezone.utc))
+        raise
+    finally:
+        _safe_set(spark, _QUERY_TAG_CONF, prev_tag)
+        _safe_set(spark, _USER_META_CONF, prev_meta)

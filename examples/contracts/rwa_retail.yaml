@@ -13,9 +13,8 @@ stages:
     inputs:
       - object: cap_silver.retail.exposures
         pin: latest
-        key: [exposure_id]
       - object: cap_ref.capital.ccf_offbalance
-        pin: contract_effective
+        pin: contract_effective          # the CCF table as of 2027-01-01, whatever runs later
     outputs:
       - object: cap_gold.retail.ead
         key: [exposure_id, reporting_period]
@@ -31,6 +30,10 @@ stages:
       tier: 1
       numeric_cols: [ead]
       distinct_col: exposure_id
+    parameters:
+      - name: reporting_period
+        default: "2027-03-31"
+        description: period stamped on every output row; a literal in the plan, so a binding change, not a logic change
     change_log:
       "2": "CCF table now pinned to contract effective date"
 
@@ -61,14 +64,16 @@ stages:
       - id: C3
         expr: NOT (lien_position = 'JUNIOR' AND first_lien_owned = false AND rw < 1.0)
         description: junior-lien rollup only when the first lien is owned
-        on_fail: fail
+        on_fail: quarantine             # rows from a run that breaks the rollup rule never stay in gold
     telemetry:
       tier: 2
       numeric_cols: [ead, rwa]
       hash_cols: [ead, rw, rwa]
     parameters:
-      - name: rw_resi_ltv_version
-        type: int
-        description: override the LTV band table version for WHAT_IF runs
+      - name: reporting_period
+        default: "2027-03-31"
+      - name: unbanded_rw
+        default: 1.0
+        description: risk weight applied when no LTV band matches; a WHAT_IF run may override it
     change_log:
       "2": "flat 50% first-lien weight replaced by LTV band lookup per 2026 SA NPR"

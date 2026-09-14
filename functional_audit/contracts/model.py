@@ -1,9 +1,12 @@
-"""Contract model. Domain-agnostic: the SDK never interprets business column names."""
+"""Contract model. Domain-agnostic: the SDK never interprets business column names.
+
+Every field here is enforced by the runtime or the CI gate; a contract must not promise a
+control the platform does not apply."""
 from __future__ import annotations
 import re
 from datetime import date
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -30,22 +33,20 @@ class RunPurpose(str, Enum):
 
 
 class PinMode(str, Enum):
-    latest = "latest"
-    contract_effective = "contract_effective"
-    explicit = "explicit"
+    latest = "latest"                        # newest Delta version at run time
+    contract_effective = "contract_effective"  # version as of the contract's effective_from
+    explicit = "explicit"                    # RunOptions.input_versions must name the version
 
 
 class OnFail(str, Enum):
-    fail = "fail"
-    warn = "warn"
-    quarantine = "quarantine"
+    fail = "fail"              # strict: quarantine rows and fail the run; warn: record a deviation
+    warn = "warn"              # record only
+    quarantine = "quarantine"  # always move this run's rows to <output>__quarantine
 
 
 class Input(BaseModel):
     object: str
     pin: PinMode = PinMode.latest
-    key: list[str] = Field(default_factory=list)
-    schema_ref: Optional[str] = None
 
     @field_validator("object")
     @classmethod
@@ -57,8 +58,7 @@ class Input(BaseModel):
 
 class Output(BaseModel):
     object: str
-    key: list[str] = Field(default_factory=list)
-    carry_run_id: bool = True
+    key: list[str] = Field(default_factory=list)   # default columns for uniqueness controls
 
     @field_validator("object")
     @classmethod
@@ -79,7 +79,7 @@ class Output(BaseModel):
 class Control(BaseModel):
     id: str
     expr: Optional[str] = None
-    type: str = "expectation"          # expectation | reconcile | uniqueness
+    type: Literal["expectation", "reconcile", "uniqueness"] = "expectation"
     on_fail: OnFail = OnFail.fail
     description: Optional[str] = None
     tolerance: Optional[float] = None
@@ -91,6 +91,14 @@ class Control(BaseModel):
         if v and RESERVED_PREFIX in v:
             raise ValueError("control expressions cannot reference reserved system columns")
         return v
+
+    @model_validator(mode="after")
+    def _shape(self) -> "Control":
+        if self.type == "expectation" and not self.expr:
+            raise ValueError(f"control {self.id}: expectation requires expr")
+        if self.type == "reconcile" and not (self.expr and self.against):
+            raise ValueError(f"control {self.id}: reconcile requires expr and against")
+        return self
 
 
 class Telemetry(BaseModel):
@@ -110,14 +118,12 @@ class Telemetry(BaseModel):
 class Semantics(BaseModel):
     ansi: bool = True
     timezone: str = "UTC"
-    decimal_scale: Optional[int] = None
     confs: dict[str, str] = Field(default_factory=dict)
 
 
 class Parameter(BaseModel):
-    """Declares what a WHAT_IF / ESTIMATE run may override."""
+    """A named value a WHAT_IF / ESTIMATE run may override; passed to the stage function by name."""
     name: str
-    type: str = "string"
     default: Any = None
     description: Optional[str] = None
 
@@ -139,6 +145,8 @@ class Contract(BaseModel):
     change_log: dict[str, str] = Field(default_factory=dict)
     calculation_id: Optional[str] = None
     bundle_version: Optional[int] = None
+    # sealed by the platform from the first successful run, never authored in YAML
+    logic_hash_declared: Optional[str] = Field(default=None, exclude=True)
 
     @field_validator("contract_id")
     @classmethod
@@ -158,6 +166,11 @@ class Contract(BaseModel):
         outs = {o.object for o in self.outputs}
         if ins & outs:
             raise ValueError(f"object cannot be both input and output: {ins & outs}")
+        if any(i.pin == PinMode.contract_effective for i in self.inputs) and not self.effective_from:
+            raise ValueError("pin: contract_effective requires effective_from")
+        names = [p.name for p in self.parameters]
+        if len(names) != len(set(names)):
+            raise ValueError("parameter names must be unique")
         return self
 
     @property
@@ -168,6 +181,9 @@ class Contract(BaseModel):
     def body_json(self) -> dict:
         return self.model_dump(mode="json")
 
+    def parameter_defaults(self) -> dict:
+        return {p.name: p.default for p in self.parameters}
+
 
 class Bundle(BaseModel):
     """One YAML that encompasses all stages of a calculation."""
@@ -176,6 +192,17 @@ class Bundle(BaseModel):
     effective_from: Optional[date] = None
     effective_to: Optional[date] = None
     stages: list[Contract] = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _defaults(cls, data):
+        if isinstance(data, dict):
+            for st in data.get("stages") or []:
+                if isinstance(st, dict):
+                    st.setdefault("contract_version", data.get("bundle_version"))
+                    st.setdefault("effective_from", data.get("effective_from"))
+                    st.setdefault("effective_to", data.get("effective_to"))
+        return data
 
     @model_validator(mode="after")
     def _propagate(self) -> "Bundle":
@@ -186,6 +213,4 @@ class Bundle(BaseModel):
             seen.add(s.contract_id)
             s.calculation_id = self.calculation_id
             s.bundle_version = self.bundle_version
-            s.effective_from = s.effective_from or self.effective_from
-            s.effective_to = s.effective_to or self.effective_to
         return self

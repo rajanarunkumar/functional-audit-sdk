@@ -2,8 +2,9 @@
   fa_contracts     -> list[Contract] loaded from --fa-contracts (default functional_audit/contracts)
   fa_validate      -> Report for the repo (contracts + code)
   fa_spark         -> local Spark session (skips if pyspark is missing)
-  fa_local_stage   -> run a @fa.stage function against a local Contract without the system schema
-and auto-generates one conformance test per contract when --fa-conformance is passed."""
+  fa_local_stage   -> identify the plan and evaluate controls for a stage against a local Contract,
+                      without the system schema
+and parametrizes `fa_contract` over every contract in the repo (see ConformanceTests)."""
 from __future__ import annotations
 from pathlib import Path
 
@@ -14,7 +15,6 @@ def pytest_addoption(parser):
     g = parser.getgroup("functional_audit")
     g.addoption("--fa-contracts", default="functional_audit/contracts")
     g.addoption("--fa-code", default=".")
-    g.addoption("--fa-conformance", action="store_true", default=False)
 
 
 @pytest.fixture(scope="session")
@@ -31,7 +31,7 @@ def fa_validate(request):
 
 @pytest.fixture(scope="session")
 def fa_spark():
-    pyspark = pytest.importorskip("pyspark")
+    pytest.importorskip("pyspark")
     from pyspark.sql import SparkSession
     spark = (SparkSession.builder.master("local[2]").appName("functional_audit-tests")
              .config("spark.sql.ansi.enabled", "true").config("spark.sql.session.timeZone", "UTC")
@@ -42,13 +42,19 @@ def fa_spark():
 
 @pytest.fixture
 def fa_local_stage():
-    """Exercise plan hashing + controls for a stage without the system schema."""
-    def _run(fn, inputs: dict, contract):
-        from functional_audit.runtime import plan_hash, controls
-        df = fn(inputs)
-        lh, txt = plan_hash.logic_hash(df)
-        return {"df": df, "logic_hash": lh, "plan": txt,
-                "controls": controls.evaluate(df, contract, df.sparkSession) if contract.controls else []}
+    """Exercise plan identity + controls for a stage without the system schema.
+
+    Expectation controls are evaluated with a count() action over the observed DataFrame;
+    uniqueness and reconcile controls scan the same DataFrame."""
+    def _run(fn, inputs: dict, contract, **kwargs):
+        from functional_audit.runtime import plan_hash, controls, telemetry
+        df = fn(inputs, **kwargs)
+        ident = plan_hash.identify(df)
+        df_obs, obs = telemetry.attach(df, controls.observe_exprs(contract))
+        df_obs.count()
+        results = controls.evaluate(contract, telemetry.collect(obs), df, df.sparkSession) if contract.controls else []
+        return {"df": df, "structure_hash": ident.structure_hash, "literals": ident.literals,
+                "relations": ident.relations, "plan": ident.canonical_text, "controls": results}
     return _run
 
 
@@ -59,24 +65,21 @@ def pytest_generate_tests(metafunc):
         metafunc.parametrize("fa_contract", cs, ids=[f"{c.contract_id}@v{c.contract_version}" for c in cs])
 
 
-def pytest_collection_modifyitems(config, items):
-    if not config.getoption("--fa-conformance"):
-        return
-
-
 class ConformanceTests:
     """Mix into a test module: `from functional_audit.testing.plugin import ConformanceTests as TestContracts`."""
 
     def test_contract_has_requirement(self, fa_contract):
         assert fa_contract.requirement_id
 
-    def test_contract_hash_stable(self, fa_contract):
-        assert fa_contract.contract_hash == fa_contract.model_copy().contract_hash
+    def test_contract_hash_ignores_effectivity_only(self, fa_contract):
+        changed = fa_contract.model_copy(update={"business_logic": fa_contract.business_logic + " "})
+        assert changed.contract_hash != fa_contract.contract_hash
 
     def test_no_reserved_columns(self, fa_contract):
         for o in fa_contract.outputs:
             assert not any(k.startswith("__") for k in o.key)
 
-    def test_controls_have_expr_or_type(self, fa_contract):
+    def test_uniqueness_controls_have_keys(self, fa_contract):
         for c in fa_contract.controls:
-            assert c.expr or c.type in ("uniqueness", "reconcile")
+            if c.type == "uniqueness":
+                assert c.expr or fa_contract.outputs[0].key

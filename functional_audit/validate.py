@@ -5,10 +5,10 @@ Checks
   V002  every @fa.stage(...) / fa.sql(..., contract_id=...) in the code has a contract
   V003  every contract has at least one stage referencing it (warn only)
   V004  duplicate (contract_id, contract_version) across files
-  V005  reserved '__' prefix misuse in inputs/outputs/keys/controls
-  V006  bundle cross-stage dependencies resolve (an input that is another stage's output exists)
-  V007  contract_hash changed but contract_version did not (against functional_audit/contracts.lock)
-  V008  logic_hash changed but contract_version did not (when a plan hash is supplied)
+  V005  reserved '__' prefix misuse in output keys, controls, telemetry
+  V006  stage dependencies inside a calculation form no cycle
+  V007  contract_hash changed but contract_version did not (against contracts.lock)
+  V008  logic_hash changed but contract_version did not (when plan hashes are supplied to validate())
 """
 from __future__ import annotations
 import ast
@@ -129,6 +129,38 @@ def write_lock(contracts_root: Path, contracts: list[Contract], logic_hashes: di
     return p
 
 
+# ---- dependency cycles ----------------------------------------------------------
+
+def dependency_cycles(contracts: list[Contract]) -> list[list[str]]:
+    """Cycles among stages of the same calculation, following output -> input edges."""
+    by_calc: dict[str, list[Contract]] = {}
+    for c in contracts:
+        if c.calculation_id:
+            by_calc.setdefault(c.calculation_id, []).append(c)
+    cycles = []
+    for stages in by_calc.values():
+        producer = {o.object: c.contract_id for c in stages for o in c.outputs}
+        edges = {c.contract_id: sorted({producer[i.object] for i in c.inputs if i.object in producer}) for c in stages}
+        state: dict[str, int] = {}
+        stack: list[str] = []
+
+        def visit(n):
+            state[n] = 1
+            stack.append(n)
+            for m in edges.get(n, []):
+                if state.get(m) == 1:
+                    cycles.append(stack[stack.index(m):] + [m])
+                elif state.get(m) is None:
+                    visit(m)
+            stack.pop()
+            state[n] = 2
+
+        for n in sorted(edges):
+            if state.get(n) is None:
+                visit(n)
+    return cycles
+
+
 # ---- validation -------------------------------------------------------------
 
 def validate(contracts_root: Path, code_root: Path | None = None,
@@ -160,29 +192,16 @@ def validate(contracts_root: Path, code_root: Path | None = None,
         for o in c.outputs:
             if any(k.startswith(RESERVED_PREFIX) for k in o.key):
                 rep.error("V005", f"reserved column in output key: {o.key}", str(path))
-        for i in c.inputs:
-            if any(k.startswith(RESERVED_PREFIX) for k in i.key):
-                rep.error("V005", f"reserved column in input key: {i.key}", str(path))
         for ctl in c.controls:
             if ctl.expr and RESERVED_PREFIX in ctl.expr:
                 rep.error("V005", f"control {ctl.id} references reserved column", str(path))
-        for hc in c.telemetry.hash_cols + c.telemetry.numeric_cols:
+        for hc in c.telemetry.hash_cols + c.telemetry.numeric_cols + ([c.telemetry.distinct_col] if c.telemetry.distinct_col else []):
             if hc.startswith(RESERVED_PREFIX):
                 rep.error("V005", f"telemetry references reserved column {hc}", str(path))
 
-    # V006 — cross-stage dependencies inside a calculation
-    outputs_by_calc: dict[str, set[str]] = {}
-    for c in contracts:
-        if c.calculation_id:
-            outputs_by_calc.setdefault(c.calculation_id, set()).update(o.object for o in c.outputs)
-    all_outputs = {o.object for c in contracts for o in c.outputs}
-    for c, _, path in loaded:
-        for i in c.inputs:
-            # an input produced by another stage must be declared somewhere in the repo
-            producer = [x for x in contracts if any(o.object == i.object for o in x.outputs)]
-            if producer and not any(p.contract_id != c.contract_id for p in producer):
-                rep.error("V006", f"{c.contract_id} reads its own output {i.object}", str(path))
-    del all_outputs, outputs_by_calc
+    # V006
+    for cyc in dependency_cycles(contracts):
+        rep.error("V006", "stage dependency cycle: " + " -> ".join(cyc))
 
     # V002 / V003 — code references
     if code_root is not None:

@@ -37,7 +37,8 @@ def test_discovers_decorator_and_sql_forms(tmp_path):
 
 
 def test_contract_drift_without_version_bump_is_v007(tmp_path):
-    c = tmp_path / "c"; c.mkdir()
+    c = tmp_path / "c"
+    c.mkdir()
     y = c / "a.yaml"
     y.write_text("contract_id: a.b\ncontract_version: 1\nrequirement_id: R\nbusiness_logic: v1\n"
                  "inputs: [{object: c.s.i}]\noutputs: [{object: c.s.o}]\n")
@@ -50,8 +51,24 @@ def test_contract_drift_without_version_bump_is_v007(tmp_path):
     assert validate(c, None).ok
 
 
+def test_dependency_cycle_inside_a_calculation_is_v006(tmp_path):
+    c = tmp_path / "c"
+    c.mkdir()
+    (c / "b.yaml").write_text(
+        "calculation_id: calc\nbundle_version: 1\nstages:\n"
+        "  - {contract_id: calc.a, requirement_id: R, business_logic: x, inputs: [{object: g.s.c_out}], outputs: [{object: g.s.a_out}]}\n"
+        "  - {contract_id: calc.b, requirement_id: R, business_logic: x, inputs: [{object: g.s.a_out}], outputs: [{object: g.s.b_out}]}\n"
+        "  - {contract_id: calc.c, requirement_id: R, business_logic: x, inputs: [{object: g.s.b_out}], outputs: [{object: g.s.c_out}]}\n")
+    rep = validate(c, None)
+    errs = [f for f in rep.findings if f.level == "ERROR"]
+    assert [f.code for f in errs] == ["V006"] and "calc.a -> calc.c -> calc.b -> calc.a" in errs[0].message
+    (c / "b.yaml").write_text((c / "b.yaml").read_text().replace("inputs: [{object: g.s.c_out}]", "inputs: [{object: g.s.raw}]"))
+    assert validate(c, None).ok
+
+
 def test_logic_drift_without_version_bump_is_v008(tmp_path):
-    c = tmp_path / "c"; c.mkdir()
+    c = tmp_path / "c"
+    c.mkdir()
     (c / "a.yaml").write_text("contract_id: a.b\ncontract_version: 1\nrequirement_id: R\nbusiness_logic: x\n"
                               "inputs: [{object: c.s.i}]\noutputs: [{object: c.s.o}]\n")
     rep = validate(c, None)

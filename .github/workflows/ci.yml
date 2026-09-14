@@ -8,13 +8,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: pip install -e ".[dev]"
       - name: fa validate (CI gate)
         run: fa validate --contracts examples/contracts --code examples
-      - name: unit tests
-        run: pytest -q
+      - name: lint
+        run: ruff check functional_audit tests
+      - name: unit + Spark tests
+        run: pytest -q --cov=functional_audit --cov-report=term
   publish:
     if: github.ref == 'refs/heads/main'
     needs: gate

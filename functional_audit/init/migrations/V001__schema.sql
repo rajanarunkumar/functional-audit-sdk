@@ -1,12 +1,10 @@
 -- functional_audit V001: system schema. Templated: ${CATALOG} ${SCHEMA}
+-- Portable Delta SQL: runs on Databricks and on OSS Spark 4 + delta-spark (used by the test suite).
 CREATE SCHEMA IF NOT EXISTS ${CATALOG}.${SCHEMA}
   COMMENT 'functional_audit: transformation contracts, run evidence, lineage, reconciliation, attestation';
 
 CREATE SCHEMA IF NOT EXISTS ${CATALOG}.${SCHEMA}_views
   COMMENT 'functional_audit: generated explain views';
-
-CREATE VOLUME IF NOT EXISTS ${CATALOG}.${SCHEMA}.plans
-  COMMENT 'functional_audit: serialized execution plans';
 
 -- human-touched -------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.contracts (
@@ -17,7 +15,7 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.contracts (
   bundle_version       INT,
   requirement_id       STRING    NOT NULL,
   rule_citation        STRING,
-  logic_hash_declared  STRING,
+  logic_hash_declared  STRING,               -- sealed from the first clean PRODUCTION run, or fa seal
   effective_from       DATE,
   effective_to         DATE,
   body                 VARIANT   NOT NULL,
@@ -26,13 +24,11 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.contracts (
   created              TIMESTAMP NOT NULL,
   created_by           STRING    NOT NULL,
   last_altered         TIMESTAMP NOT NULL,
-  last_altered_by      STRING    NOT NULL,
-  CONSTRAINT pk_contracts PRIMARY KEY (contract_id, contract_version) NOT ENFORCED
+  last_altered_by      STRING    NOT NULL
 )
 USING DELTA
 CLUSTER BY (contract_id, contract_version)
-TBLPROPERTIES (delta.enableChangeDataFeed = true, delta.enableRowTracking = true,
-               'functional_audit.write_class' = 'human');
+TBLPROPERTIES (delta.enableChangeDataFeed = true, 'functional_audit.write_class' = 'human');
 
 CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.attestations (
   attestation_id   STRING    NOT NULL,
@@ -44,8 +40,7 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.attestations (
   created          TIMESTAMP NOT NULL,
   created_by       STRING    NOT NULL,
   last_altered     TIMESTAMP NOT NULL,
-  last_altered_by  STRING    NOT NULL,
-  CONSTRAINT pk_attestations PRIMARY KEY (attestation_id) NOT ENFORCED
+  last_altered_by  STRING    NOT NULL
 )
 USING DELTA
 CLUSTER BY (contract_id, run_id)
@@ -58,7 +53,7 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.contract_deps (
   direction         STRING NOT NULL,      -- INPUT | OUTPUT
   object_name       STRING NOT NULL,
   pin_mode          STRING,
-  created           TIMESTAMP NOT NULL
+  created           TIMESTAMP NOT NULL    -- newest row per (contract, version, direction, object) is current
 )
 USING DELTA CLUSTER BY (contract_id, contract_version)
 TBLPROPERTIES ('functional_audit.write_class' = 'system');
@@ -74,10 +69,13 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.runs (
   backfill_id            STRING,
   supersedes_run_id      STRING,
   reporting_period       STRING,
-  logic_hash_executed    STRING,
+  logic_hash_executed    STRING,             -- structure hash of the optimized plan, literals lifted
+  binding_hash           STRING,             -- literals + pinned input versions + period + parameters
   code_hash              STRING,
-  plan_proto_path        STRING,
-  plan_proto             BINARY,
+  code_hash_source       STRING,             -- source | name (name when the function source was unavailable)
+  plan_text              STRING,             -- canonical plan text that produced logic_hash_executed
+  literals               VARIANT,            -- lifted literal vector, in plan order
+  plan_proto             BINARY,             -- serialized Spark Connect plan when small enough
   workspace_id           STRING,
   metastore_id           STRING,
   entity_type            STRING,
@@ -96,10 +94,9 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.runs (
   started_at             TIMESTAMP,
   ended_at               TIMESTAMP,
   output_commit_version  BIGINT,
-  status                 STRING    NOT NULL,
-  attestation_stage      STRING,
-  created                TIMESTAMP NOT NULL,
-  CONSTRAINT pk_runs PRIMARY KEY (run_id) NOT ENFORCED
+  status                 STRING    NOT NULL, -- RUNNING | SUCCEEDED | QUARANTINED | FAILED | ABANDONED
+  attestation_stage      STRING,             -- PROVISIONAL | FINAL
+  created                TIMESTAMP NOT NULL
 )
 USING DELTA CLUSTER BY (contract_id, run_id)
 TBLPROPERTIES (delta.enableChangeDataFeed = true, 'functional_audit.write_class' = 'system');
@@ -128,7 +125,7 @@ TBLPROPERTIES ('functional_audit.write_class' = 'system');
 
 CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.evidence (
   run_id         STRING  NOT NULL,
-  evidence_type  STRING  NOT NULL,   -- observe | delta_ops | controls | overhead | cost | context
+  evidence_type  STRING  NOT NULL,   -- observe | delta_ops | controls | context | plan | error
   payload        VARIANT NOT NULL,
   created        TIMESTAMP NOT NULL
 )
@@ -148,7 +145,7 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.lineage_observed (
   match_method   STRING NOT NULL,     -- ENTITY | TAG | WINDOW
   created        TIMESTAMP NOT NULL
 )
-USING DELTA CLUSTER BY (run_id, level)
+USING DELTA CLUSTER BY (run_id, created)
 TBLPROPERTIES ('functional_audit.write_class' = 'system');
 
 CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.query_observed (
@@ -162,7 +159,7 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.query_observed (
   match_method         STRING NOT NULL,
   created              TIMESTAMP NOT NULL
 )
-USING DELTA CLUSTER BY (run_id)
+USING DELTA CLUSTER BY (run_id, created)
 TBLPROPERTIES ('functional_audit.write_class' = 'system');
 
 CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.reconciliations (
@@ -172,8 +169,7 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}.reconciliations (
   checks        VARIANT NOT NULL,
   deviations    VARIANT,
   created       TIMESTAMP NOT NULL,
-  last_altered  TIMESTAMP NOT NULL,
-  CONSTRAINT pk_reconciliations PRIMARY KEY (run_id) NOT ENFORCED
+  last_altered  TIMESTAMP NOT NULL
 )
 USING DELTA CLUSTER BY (run_id)
 TBLPROPERTIES (delta.enableChangeDataFeed = true, 'functional_audit.write_class' = 'system');
@@ -182,5 +178,6 @@ CREATE TABLE IF NOT EXISTS ${CATALOG}.${SCHEMA}._migrations (
   version     STRING NOT NULL,
   applied_at  TIMESTAMP NOT NULL,
   applied_by  STRING NOT NULL,
-  sdk_version STRING NOT NULL
+  sdk_version STRING NOT NULL,
+  checksum    STRING NOT NULL
 ) USING DELTA;

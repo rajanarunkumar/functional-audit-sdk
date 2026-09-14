@@ -7,9 +7,9 @@ Public surface:
     fa.business_columns(df)     strip reserved system columns
     fa.diff_runs(a, b)          decompose the difference between two runs
 """
-from functional_audit.config import Settings, settings
-from functional_audit.runtime.stage import stage, sql
+from functional_audit.config import Settings
+from functional_audit.runtime.stage import stage, sql, RunOptions, StageError
 from functional_audit.runtime.explain import explain_table, business_columns, diff_runs
 
-__version__ = "0.1.0"
-__all__ = ["stage", "sql", "explain_table", "business_columns", "diff_runs", "Settings", "settings"]
+__version__ = "0.2.0"
+__all__ = ["stage", "sql", "RunOptions", "StageError", "explain_table", "business_columns", "diff_runs", "Settings"]

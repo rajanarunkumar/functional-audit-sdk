@@ -1,6 +1,10 @@
 """Time-ordered identifiers (UUIDv7) and stable content hashes."""
 from __future__ import annotations
-import hashlib, json, os, time, uuid
+import hashlib
+import json
+import os
+import time
+import uuid
 
 
 def uuid7() -> str:

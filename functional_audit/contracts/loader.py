@@ -1,5 +1,5 @@
-"""Load contract YAML from disk. Bundle stages are flattened to Contract rows;
-a stage's contract_version defaults to the bundle version."""
+"""Load contract YAML. A file is either one Contract or a Bundle, whose stages are flattened
+to Contract rows; a stage's contract_version and effectivity default to the bundle's."""
 from __future__ import annotations
 from pathlib import Path
 
@@ -15,26 +15,22 @@ class ContractLoadError(Exception):
         self.path = path
 
 
-def _is_bundle(doc: dict) -> bool:
-    return "stages" in doc and "calculation_id" in doc
+def parse_document(raw: str) -> list[Contract]:
+    doc = yaml.safe_load(raw)
+    if not isinstance(doc, dict):
+        raise ValueError("top-level must be a mapping")
+    if "stages" in doc and "calculation_id" in doc:
+        return list(Bundle.model_validate(doc).stages)
+    return [Contract.model_validate(doc)]
 
 
 def load_file(path: Path) -> list[tuple[Contract, str]]:
     raw = path.read_text()
     try:
-        doc = yaml.safe_load(raw)
+        return [(c, raw) for c in parse_document(raw)]
     except yaml.YAMLError as e:
         raise ContractLoadError(path, f"invalid YAML: {e}") from e
-    if not isinstance(doc, dict):
-        raise ContractLoadError(path, "top-level must be a mapping")
-    try:
-        if _is_bundle(doc):
-            for st in doc["stages"]:
-                st.setdefault("contract_version", doc["bundle_version"])
-            b = Bundle.model_validate(doc)
-            return [(c, raw) for c in b.stages]
-        return [(Contract.model_validate(doc), raw)]
-    except ValidationError as e:
+    except (ValidationError, ValueError) as e:
         raise ContractLoadError(path, str(e)) from e
 
 
